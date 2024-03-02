@@ -262,6 +262,13 @@ SECTIONS
 	}
 	_edata_loc = __data_loc + SIZEOF(.data);
 
+	. = ALIGN(32);
+	__start_hwlog_tag = .;
+	__start_hwlog_tag : {
+		*(__hwlog_tag)
+	}
+	__stop_hwlog_tag = .;
+
 #ifdef CONFIG_HAVE_TCM
         /*
 	 * We align everything to a page boundary so we can

@@ -1,0 +1,37 @@
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/pinctrl/mt6765-pinfunc.h>
+#include <dt-bindings/clock/mt6765-clk.h>
+/dts-v1/;
+/plugin/;
+
+#include "huawei_audio/huawei_mt6735_accdet.dtsi"
+#include "huawei_common/huawei_common.dtsi"
+#include "huawei_mt6762_amn_al10_va/huawei.dtsi"
+
+&rootparam {
+    mtk,boardid = <4 1 2 8>;
+    mtk,board_name = "AMN_AL10_VA";
+    mtk,product_name = "AMN-AL10";
+    hardware_version = "HL1AMNMY";
+};
+
+&dev_detect{
+    dc_dc = <1>;
+    fflash = <1>;
+};
+
+&antenna_boardid_detect {
+    expect_value = <2112>;
+};
+
+&smartpakit {
+    status = "disabled";
+};
+#include <k62v1_64_mexico/cust.dtsi>
+#include "huawei_mt6762_amn_al10_va/huawei-camera.dtsi"
+&i2c5 {
+	clock-frequency = <400000>;
+};
+/*End of this file, DO NOT ADD ANYTHING HERE*/
+

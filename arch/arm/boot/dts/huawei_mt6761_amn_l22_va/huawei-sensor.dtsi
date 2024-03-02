@@ -1,0 +1,5 @@
+&psensor_enable {
+	compatible = "mediatek,psensor";
+	status = "okay";
+	psensor,ldo_ven = <&pio 170 0x00>;
+	};

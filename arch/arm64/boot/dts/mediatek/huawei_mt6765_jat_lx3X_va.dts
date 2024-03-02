@@ -1,0 +1,30 @@
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/pinctrl/mt6765-pinfunc.h>
+#include <dt-bindings/clock/mt6765-clk.h>
+/dts-v1/;
+/plugin/;
+
+#include "huawei_common/huawei_common.dtsi"
+#include "huawei_mt6765_jat_lx3X_va/huawei.dtsi"
+#include "huawei_audio/huawei_mt6735_accdet.dtsi"
+#include "huawei_audio/huawei_mt676x_audio_gpio.dtsi"
+#include "huawei_audio/cs35l41.dtsi"
+#include "huawei_audio/tas2557.dtsi"
+#include "huawei_audio/tfa9894.dtsi"
+
+&rootparam {
+    mtk,boardid = <4 2 3 3>;
+    mtk,board_name = "JAT_LX3X_VA";
+    mtk,product_name = "JAT-LX3";
+    hardware_version = "HL1JATMY";
+};
+
+&antenna_boardid_detect {
+    expect_value = <2066>;
+};
+
+#include <k62v1_64_mexico/cust.dtsi>
+#include "huawei_mt6765_jat_lx3X_va/huawei-camera.dtsi"
+/*End of this file, DO NOT ADD ANYTHING HERE*/
+
