@@ -15,11 +15,17 @@
 #include <linux/mmu_notifier.h>
 #include <linux/page_idle.h>
 #include <linux/shmem_fs.h>
+#include <linux/mm_inline.h>
+#include <linux/ctype.h>
 
 #include <asm/elf.h>
 #include <asm/uaccess.h>
 #include <asm/tlbflush.h>
 #include "internal.h"
+
+#ifdef CONFIG_HUAWEI_SWAP_ZDATA
+#include <linux/signal.h>
+#endif
 
 void task_mem(struct seq_file *m, struct mm_struct *mm)
 {
@@ -898,6 +904,472 @@ static int tid_smaps_open(struct inode *inode, struct file *file)
 	return do_maps_open(inode, file, &proc_tid_smaps_op);
 }
 
+#ifdef CONFIG_HUAWEI_PROC_SMAPS_CLASSIFY
+typedef struct stats_t {
+	unsigned long pss;
+	unsigned long swappablePss;
+	unsigned long rss;
+	unsigned long privateDirty;
+	unsigned long sharedDirty;
+	unsigned long privateClean;
+	unsigned long sharedClean;
+	unsigned long swappedOut;
+	unsigned long swappedOutPss;
+}stats_t;
+enum {
+	HEAP_UNKNOWN,
+	HEAP_DALVIK,
+	HEAP_NATIVE,
+
+	HEAP_DALVIK_OTHER,
+	HEAP_STACK,
+	HEAP_CURSOR,
+	HEAP_ASHMEM,
+	HEAP_GL_DEV,
+	HEAP_UNKNOWN_DEV,
+	HEAP_SO,
+	HEAP_JAR,
+	HEAP_APK,
+	HEAP_TTF,
+	HEAP_DEX,
+	HEAP_OAT,
+	HEAP_ART,
+	HEAP_UNKNOWN_MAP,
+	HEAP_GRAPHICS,
+	HEAP_GL,
+	HEAP_OTHER_MEMTRACK,
+
+	// Dalvik extra sections (heap).
+	HEAP_DALVIK_NORMAL,
+	HEAP_DALVIK_LARGE,
+	HEAP_DALVIK_ZYGOTE,
+	HEAP_DALVIK_NON_MOVING,
+
+	// Dalvik other extra sections.
+	HEAP_DALVIK_OTHER_LINEARALLOC,
+	HEAP_DALVIK_OTHER_ACCOUNTING,
+	HEAP_DALVIK_OTHER_CODE_CACHE,
+	HEAP_DALVIK_OTHER_COMPILER_METADATA,
+	HEAP_DALVIK_OTHER_INDIRECT_REFERENCE_TABLE,
+
+	// Boot vdex / app dex / app vdex
+	HEAP_DEX_BOOT_VDEX,
+	HEAP_DEX_APP_DEX,
+	HEAP_DEX_APP_VDEX,
+
+	// App art, boot art.
+	HEAP_ART_APP,
+	HEAP_ART_BOOT,
+
+	_NUM_HEAP,
+	_NUM_EXCLUSIVE_HEAP = HEAP_OTHER_MEMTRACK+1,
+	_NUM_CORE_HEAP = HEAP_NATIVE+1
+};
+void get_vma_name(struct vm_area_struct *vma , char *name_buffer){
+	const char __user *name = vma_get_anon_name(vma);
+	struct mm_struct *mm = vma->vm_mm;
+
+	unsigned long page_start_vaddr;
+	unsigned long page_offset;
+	unsigned long num_pages;
+	unsigned long max_len = NAME_MAX;
+	int i;
+
+	page_start_vaddr = (unsigned long)name & PAGE_MASK;
+	page_offset = (unsigned long)name - page_start_vaddr;
+	num_pages = DIV_ROUND_UP(page_offset + max_len, PAGE_SIZE);
+
+	char *head = "[anon:";
+	char *tail = "]";
+	char *temp = NULL;
+	strcpy(name_buffer,head);
+
+	for (i = 0; i < num_pages; i++) {
+		int len;
+		int write_len;
+		const char *kaddr;
+		long pages_pinned;
+		struct page *page;
+		pages_pinned = get_user_pages_remote(current, mm,
+				    page_start_vaddr, 1, 0, &page, NULL);
+		if (pages_pinned < 1) {
+			temp = "<fault>]";
+			strcat(name_buffer,temp);
+			return;
+		}
+		kaddr = (const char *)kmap(page);
+		len = min(max_len, PAGE_SIZE - page_offset);
+		write_len = strnlen(kaddr + page_offset, len);
+		memcpy(name_buffer+6,kaddr+page_offset,write_len);
+		strcat(name_buffer,tail);
+		kunmap(page);
+		put_page(page);
+        /* if strnlen hit a null terminator then we're done */
+		if (write_len != len)
+			break;
+		max_len -= len;
+		page_offset = 0;
+		page_start_vaddr += PAGE_SIZE;
+	}
+}
+void getFileNameOrVmaName(struct seq_file *m,struct vm_area_struct *vma,char *name){
+	struct mm_struct *mm = vma->vm_mm;
+	struct file *filp = vma->vm_file;
+	struct proc_maps_private *priv = m->private;
+	char buf[1024];
+	const char *temp = NULL;
+	memset(&buf,0,sizeof(buf));
+
+	if(filp){
+		strcpy(name,d_path(&filp->f_path,buf,1024));
+		return;
+	}
+	if (vma->vm_ops && vma->vm_ops->name) {
+		temp = vma->vm_ops->name(vma);
+		if (temp)
+			strcpy(name,temp);
+			return;
+	}
+	temp = arch_vma_name(vma);
+	if (!temp) {
+		if (!mm) {
+			temp = "[vdso]";
+			strcpy(name,temp);
+			return;
+		}
+		if (vma->vm_start <= mm->brk &&
+		    vma->vm_end >= mm->start_brk) {
+			temp = "[heap]";
+			strcpy(name,temp);
+			return;
+		}
+		if (is_stack(priv, vma)) {
+			temp = "[stack]";
+			strcpy(name,temp);
+			return;
+		}
+		if (vma_get_anon_name(vma)) {
+			get_vma_name(vma, name);
+			return;
+		}
+	}
+	return;
+}
+static void setAddressForVma(struct vm_area_struct *vma, uint64_t *start, uint64_t *end){
+	if(vma!=NULL){
+		*start = vma->vm_start;
+		*end = vma->vm_end;
+	}
+}
+static void setByConfig_shmem(struct vm_area_struct *vma, struct mem_size_stats* mss, struct mm_walk *smaps_walk){
+#ifdef CONFIG_SHMEM
+	if (vma->vm_file && shmem_mapping(vma->vm_file->f_mapping)) {
+		unsigned long shmem_swapped = shmem_swap_usage(vma);
+		if (!shmem_swapped || (vma->vm_flags & VM_SHARED) ||
+			!(vma->vm_flags & VM_WRITE)) {
+			mss->swap = shmem_swapped;
+		} else {
+			mss->check_shmem_swap = true;
+			smaps_walk->pte_hole = smaps_pte_hole;
+		}
+	}
+#endif
+}
+void merge_vmas(struct seq_file *m,void* v, stats_t* stats)
+{
+	struct vm_area_struct *vma = v;
+	struct mem_size_stats mss;
+	struct proc_maps_private *priv = m->private;
+	struct mm_walk smaps_walk = {
+		.pmd_entry = smaps_pte_range,
+		.mm = vma->vm_mm,
+		.private = &mss,
+	};
+
+	int len, nameLen = 0;
+
+	unsigned long swappable_pss = 0;
+	bool is_swappable = false;
+
+	uint64_t start;
+	uint64_t end = 0;
+	uint64_t prevEnd = 0;
+	char name[1024];
+
+	int whichHeap = HEAP_UNKNOWN;
+	int subHeap = HEAP_UNKNOWN;
+	int prevHeap = HEAP_UNKNOWN;
+
+	while (vma) {
+		if (vma->vm_mm && !is_vm_hugetlb_page(vma)){
+			memset(&mss, 0, sizeof mss);
+			smaps_walk.mm = vma->vm_mm;
+			setByConfig_shmem(vma, &mss, &smaps_walk);
+			walk_page_vma(vma, &smaps_walk);
+			prevHeap = whichHeap;
+			prevEnd = end;
+			whichHeap = HEAP_UNKNOWN;
+			subHeap = HEAP_UNKNOWN;
+			is_swappable = false;
+			memset(&name,0,sizeof(name));
+			start = vma->vm_start;
+			end = vma->vm_end;
+			getFileNameOrVmaName(m,vma,name);
+			nameLen = strlen(name);
+			// Trim the end of the line if it is " (deleted)".
+			const char* deleted_str = " (deleted)";
+			if (nameLen > (int)strlen(deleted_str) &&
+				strcmp(name+nameLen-strlen(deleted_str), deleted_str) == 0) {
+				nameLen -= strlen(deleted_str);
+				name[nameLen] = '\0';
+			}
+			if ((strstr(name, "[heap]") == name)) {
+				whichHeap = HEAP_NATIVE;
+			} else if (strncmp(name, "[anon:libc_malloc]", 18) == 0) {
+				whichHeap = HEAP_NATIVE;
+			} else if (strncmp(name, "[stack", 6) == 0) {
+				whichHeap = HEAP_STACK;
+			} else if (nameLen > 3 && strcmp(name+nameLen-3, ".so") == 0) {
+				whichHeap = HEAP_SO;
+				is_swappable = true;
+			} else if (nameLen > 4 && strcmp(name+nameLen-4, ".jar") == 0) {
+				whichHeap = HEAP_JAR;
+				is_swappable = true;
+			} else if (nameLen > 4 && strcmp(name+nameLen-4, ".apk") == 0) {
+				whichHeap = HEAP_APK;
+				is_swappable = true;
+			} else if (nameLen > 4 && strcmp(name+nameLen-4, ".ttf") == 0) {
+				whichHeap = HEAP_TTF;
+				is_swappable = true;
+			} else if ((nameLen > 4 && strstr(name, ".dex") != NULL) ||
+					    (nameLen > 5 && strcmp(name+nameLen-5, ".odex") == 0)) {
+				whichHeap = HEAP_DEX;
+				subHeap = HEAP_DEX_APP_DEX;
+				is_swappable = true;
+			} else if (nameLen > 5 && strcmp(name+nameLen-5, ".vdex") == 0) {
+				whichHeap = HEAP_DEX;
+				// Handle system@framework@boot* and system/framework/boot*
+				if (strstr(name, "@boot") != NULL || strstr(name, "/boot") != NULL) {
+					subHeap = HEAP_DEX_BOOT_VDEX;
+				} else {
+					subHeap = HEAP_DEX_APP_VDEX;
+				}
+					is_swappable = true;
+			}else if (nameLen > 4 && strcmp(name+nameLen-4, ".oat") == 0) {
+				whichHeap = HEAP_OAT;
+				is_swappable = true;
+			} else if (nameLen > 4 && strcmp(name+nameLen-4, ".art") == 0) {
+				whichHeap = HEAP_ART;
+				// Handle system@framework@boot* and system/framework/boot*
+				if (strstr(name, "@boot") != NULL || strstr(name, "/boot") != NULL) {
+					subHeap = HEAP_ART_BOOT;
+				} else {
+					subHeap = HEAP_ART_APP;
+				}
+				is_swappable = true;
+			} else if (strncmp(name, "/dev/", 5) == 0) {
+				if (strncmp(name, "/dev/kgsl-3d0", 13) == 0) {
+					whichHeap = HEAP_GL_DEV;
+				} else if (strncmp(name, "/dev/ashmem", 11) == 0) {
+					if (strncmp(name, "/dev/ashmem/dalvik-", 19) == 0) {
+						whichHeap = HEAP_DALVIK_OTHER;
+						if (strstr(name, "/dev/ashmem/dalvik-LinearAlloc") == name) {
+							subHeap = HEAP_DALVIK_OTHER_LINEARALLOC;
+						} else if ((strstr(name, "/dev/ashmem/dalvik-alloc space") == name) ||
+								    (strstr(name, "/dev/ashmem/dalvik-main space") == name)) {
+							// This is the regular Dalvik heap.
+							whichHeap = HEAP_DALVIK;
+							subHeap = HEAP_DALVIK_NORMAL;
+						} else if (strstr(name, "/dev/ashmem/dalvik-large object space") == name ||
+								    strstr(name, "/dev/ashmem/dalvik-free list large object space")== name) {
+							whichHeap = HEAP_DALVIK;
+							subHeap = HEAP_DALVIK_LARGE;
+						} else if (strstr(name, "/dev/ashmem/dalvik-non moving space") == name) {
+							whichHeap = HEAP_DALVIK;
+							subHeap = HEAP_DALVIK_NON_MOVING;
+						} else if (strstr(name, "/dev/ashmem/dalvik-zygote space") == name) {
+							whichHeap = HEAP_DALVIK;
+							subHeap = HEAP_DALVIK_ZYGOTE;
+						} else if (strstr(name, "/dev/ashmem/dalvik-indirect ref") == name) {
+							subHeap = HEAP_DALVIK_OTHER_INDIRECT_REFERENCE_TABLE;
+						} else if (strstr(name, "/dev/ashmem/dalvik-jit-code-cache") == name ||
+								    strstr(name, "/dev/ashmem/dalvik-data-code-cache") == name) {
+							subHeap = HEAP_DALVIK_OTHER_CODE_CACHE;
+						} else if (strstr(name, "/dev/ashmem/dalvik-CompilerMetadata") == name) {
+							subHeap = HEAP_DALVIK_OTHER_COMPILER_METADATA;
+						} else {
+							subHeap = HEAP_DALVIK_OTHER_ACCOUNTING;  // Default to accounting.
+						}
+					} else if (strncmp(name, "/dev/ashmem/CursorWindow", 24) == 0) {
+						whichHeap = HEAP_CURSOR;
+					} else if (strncmp(name, "/dev/ashmem/libc malloc", 23) == 0) {
+						whichHeap = HEAP_NATIVE;
+					} else {
+						whichHeap = HEAP_ASHMEM;
+					}
+				} else {
+					whichHeap = HEAP_UNKNOWN_DEV;
+				}
+			} else if (strncmp(name, "[anon:", 6) == 0) {
+				whichHeap = HEAP_UNKNOWN;
+			} else if (nameLen > 0) {
+				whichHeap = HEAP_UNKNOWN_MAP;
+			} else if (start == prevEnd && prevHeap == HEAP_SO) {
+				// bss section of a shared library.
+				whichHeap = HEAP_SO;
+			}
+			unsigned long ps = (unsigned long)(mss.pss>>(10+PSS_SHIFT));
+			unsigned long pc = (unsigned long)(mss.private_clean>>10);
+			unsigned long pd = (unsigned long)(mss.private_dirty>>10);
+			unsigned long sc = (unsigned long)(mss.shared_clean>>10);
+			unsigned long sd = (unsigned long)(mss.shared_dirty>>10);
+			if (is_swappable && (ps > 0)) {
+				swappable_pss = 0;
+				if ((sc > 0) || (sd > 0)) {
+					swappable_pss = (unsigned long)((ps-pc-pd)/(sc+sd)*sc) + pc;
+				} else{
+					swappable_pss = pc;
+				}
+			} else
+				swappable_pss = 0;
+
+			stats[whichHeap].pss += (unsigned long)(mss.pss>>(10+PSS_SHIFT));
+			stats[whichHeap].swappablePss += (unsigned long)swappable_pss;
+			stats[whichHeap].rss += (unsigned long)(mss.resident>>10);
+			stats[whichHeap].privateDirty += (unsigned long)(mss.private_dirty>>10);
+			stats[whichHeap].sharedDirty += (unsigned long)(mss.shared_dirty>>10);
+			stats[whichHeap].privateClean += (unsigned long)(mss.private_clean>>10);
+			stats[whichHeap].sharedClean += (unsigned long)(mss.shared_clean>>10);
+			stats[whichHeap].swappedOut += (unsigned long)(mss.swap>>10);
+			stats[whichHeap].swappedOutPss += (unsigned long)(mss.swap_pss>>(10+PSS_SHIFT));
+			if (whichHeap == HEAP_DALVIK || whichHeap == HEAP_DALVIK_OTHER ||
+					whichHeap == HEAP_DEX || whichHeap == HEAP_ART) {
+				stats[subHeap].pss += (unsigned long)(mss.pss>>(10+PSS_SHIFT));
+				stats[subHeap].swappablePss += (unsigned long)(swappable_pss);
+				stats[subHeap].rss += (unsigned long)(mss.resident>>10);
+				stats[subHeap].privateDirty += (unsigned long)(mss.private_dirty>>10);
+				stats[subHeap].sharedDirty += (unsigned long)(mss.shared_dirty>>10);
+				stats[subHeap].privateClean += (unsigned long)(mss.private_clean>>10);
+				stats[subHeap].sharedClean += (unsigned long)(mss.shared_clean>>10);
+				stats[subHeap].swappedOut += (unsigned long)(mss.swap>>10);
+				stats[subHeap].swappedOutPss += (unsigned long)(mss.swap_pss>>(10+PSS_SHIFT));
+			}
+		}
+		vma = m_next_vma(priv, vma);
+		//This judgement is to keep same with native code in native,
+		//it may be corrected in next version.
+		setAddressForVma(vma, &start, &end);
+	}
+}
+static int show_smap_classify(struct seq_file *m, void *v){
+	struct vm_area_struct *vma = v;
+	stats_t stats[_NUM_HEAP];
+	memset(&stats, 0, sizeof stats);
+	merge_vmas(m, vma, stats);
+
+	int i=0;
+	for(;i<_NUM_HEAP;i++){
+		seq_printf(m,"%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\n",stats[i].pss,stats[i].swappablePss,
+				    stats[i].rss,stats[i].privateDirty,stats[i].sharedDirty,
+				    stats[i].privateClean,stats[i].sharedClean,
+				    stats[i].swappedOut,stats[i].swappedOutPss);
+	}
+	m->version = -1UL;//end flag
+	return 0;
+}
+
+static void *classify_next(struct seq_file *p, void *v, loff_t *pos)
+{
+	vma_stop(p->private);
+	return NULL;
+}
+
+static const struct seq_operations proc_smaps_classify_op = {
+	.start	= m_start,
+	.next	= classify_next,
+	.stop	= m_stop,
+	.show	= show_smap_classify
+};
+
+static int proc_pid_smaps_classify_open(struct inode *inode, struct file *file)
+{
+	return do_maps_open(inode, file, &proc_smaps_classify_op);
+}
+
+const struct file_operations proc_pid_smaps_classify_operations = {
+	.open	= proc_pid_smaps_classify_open,
+	.read	= seq_read,
+	.llseek	= seq_lseek,
+	.release= proc_map_release
+};
+#endif
+
+static int proc_pid_smaps_simple_show(struct seq_file *m, void *v)
+{
+	struct vm_area_struct *vma = v;
+	struct mem_size_stats mss;
+	struct mem_size_stats mss_total;
+	struct proc_maps_private *priv = m->private;
+
+	struct mm_walk smaps_walk = {
+		.pmd_entry = smaps_pte_range,
+		.private = &mss,
+	};
+
+	memset(&mss_total, 0, sizeof mss_total);
+
+	unsigned long totalUss = 0;
+
+	while (vma) {
+		if (vma->vm_mm && !is_vm_hugetlb_page(vma)) {
+			memset(&mss, 0, sizeof mss);
+			smaps_walk.mm = vma->vm_mm;
+			walk_page_vma(vma, &smaps_walk);
+			mss_total.pss += mss.pss;
+			totalUss += (mss.private_clean + mss.private_dirty);
+			mss_total.swap_pss += mss.swap_pss;
+		}
+		vma = m_next_vma(priv, vma);
+	}
+
+	seq_printf(m, "Pss: %lu KB\n"
+			"Uss: %lu KB\n"
+			"SPP: %lu KB\n",
+			(unsigned long)(mss_total.pss >> (10 + PSS_SHIFT)),
+			totalUss >> 10,
+			(unsigned long)(mss_total.swap_pss >> (10 + PSS_SHIFT)));
+
+	m->version = -1UL;//end flag
+
+	return 0;
+}
+
+static void *simple_next(struct seq_file *p,void *v, loff_t *pos)
+{
+	vma_stop(p->private);
+	return NULL;
+}
+
+static const struct seq_operations proc_smaps_simple_op = {
+	.start	= m_start,
+	.next	= simple_next,
+	.stop	= m_stop,
+	.show	= proc_pid_smaps_simple_show
+};
+
+
+static int proc_pid_smaps_simple_open(struct inode *inode, struct file *file)
+{
+	return do_maps_open(inode, file, &proc_smaps_simple_op);
+}
+
+const struct file_operations proc_pid_smaps_simple_operations = {
+	.open		= proc_pid_smaps_simple_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= proc_map_release,
+};
+
 const struct file_operations proc_pid_smaps_operations = {
 	.open		= pid_smaps_open,
 	.read		= seq_read,
@@ -1121,8 +1593,16 @@ static ssize_t clear_refs_write(struct file *file, const char __user *buf,
 					goto out_mm;
 				}
 				for (vma = mm->mmap; vma; vma = vma->vm_next) {
-					vma->vm_flags &= ~VM_SOFTDIRTY;
+#ifdef CONFIG_SPECULATIVE_PAGE_FAULT
+					vm_write_begin(vma);
+					WRITE_ONCE(vma->vm_flags,
+						   vma->vm_flags & ~VM_SOFTDIRTY);
 					vma_set_page_prot(vma);
+					vm_write_end(vma);
+#else
+					vma->vm_flags &= ~VM_SOFTDIRTY;				
+					vma_set_page_prot(vma);
+#endif
 				}
 				downgrade_write(&mm->mmap_sem);
 				break;
@@ -1525,6 +2005,288 @@ const struct file_operations proc_pagemap_operations = {
 	.release	= pagemap_release,
 };
 #endif /* CONFIG_PROC_PAGE_MONITOR */
+
+#ifdef CONFIG_PROCESS_RECLAIM
+static int reclaim_pte_range(pmd_t *pmd, unsigned long addr,
+				unsigned long end, struct mm_walk *walk)
+{
+	struct reclaim_param *rp = walk->private;
+	struct vm_area_struct *vma = rp->vma;
+	pte_t *pte, ptent;
+	spinlock_t *ptl;
+	struct page *page;
+	LIST_HEAD(page_list);
+	int isolated;
+	int reclaimed;
+
+	split_huge_pmd(vma, addr, pmd);
+	if (pmd_trans_unstable(pmd) || !rp->nr_to_reclaim)
+		return 0;
+cont:
+#ifdef CONFIG_HUAWEI_SWAP_ZDATA
+	if (process_reclaim_need_abort(walk))
+		return -EINTR;
+#endif
+	isolated = 0;
+	pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
+	for (; addr != end; pte++, addr += PAGE_SIZE) {
+		ptent = *pte;
+		if (!pte_present(ptent))
+			continue;
+
+		page = vm_normal_page(vma, addr, ptent);
+		if (!page)
+			continue;
+#ifdef CONFIG_TASK_PROTECT_LRU
+		// don't reclaim page in protected.
+		if (PageProtect(page))
+			continue;
+#endif
+		if (rp->type == RECLAIM_ANON && !PageAnon(page))
+			continue;
+		if (rp->type == RECLAIM_FILE && PageAnon(page))
+			continue;
+
+		if (isolate_lru_page(page))
+			continue;
+
+		list_add(&page->lru, &page_list);
+		inc_node_page_state(page, NR_ISOLATED_ANON +
+				page_is_file_cache(page));
+		isolated++;
+		rp->nr_scanned++;
+		if ((isolated >= SWAP_CLUSTER_MAX) || !rp->nr_to_reclaim)
+			break;
+	}
+	pte_unmap_unlock(pte - 1, ptl);
+#ifdef CONFIG_HUAWEI_SWAP_ZDATA
+	reclaimed = reclaim_pages_from_list(&page_list, vma,
+			rp->hiber, &rp->nr_writedblock);
+#else
+	reclaimed = reclaim_pages_from_list(&page_list, vma);
+#endif
+	rp->nr_reclaimed += reclaimed;
+	rp->nr_to_reclaim -= reclaimed;
+	if (rp->nr_to_reclaim < 0)
+		rp->nr_to_reclaim = 0;
+
+	if (rp->nr_to_reclaim && (addr != end))
+		goto cont;
+
+	cond_resched();
+	return 0;
+}
+
+struct reclaim_param reclaim_task_anon(struct task_struct *task,
+				int nr_to_reclaim)
+{
+	struct mm_struct *mm;
+	struct vm_area_struct *vma;
+	struct mm_walk reclaim_walk = {};
+	struct reclaim_param rp;
+
+	rp.nr_reclaimed = 0;
+	rp.nr_scanned = 0;
+	get_task_struct(task);
+	mm = get_task_mm(task);
+	if (!mm)
+		goto out;
+
+	reclaim_walk.mm = mm;
+	reclaim_walk.pmd_entry = reclaim_pte_range;
+
+	rp.nr_to_reclaim = nr_to_reclaim;
+	reclaim_walk.private = &rp;
+
+	down_read(&mm->mmap_sem);
+	for (vma = mm->mmap; vma; vma = vma->vm_next) {
+		if (is_vm_hugetlb_page(vma))
+			continue;
+
+		if (vma->vm_file)
+			continue;
+
+		if (!rp.nr_to_reclaim)
+			break;
+
+		rp.vma = vma;
+		walk_page_range(vma->vm_start, vma->vm_end,
+			&reclaim_walk);
+	}
+
+	flush_tlb_mm(mm);
+	up_read(&mm->mmap_sem);
+	mmput(mm);
+out:
+	put_task_struct(task);
+	return rp;
+}
+
+static ssize_t reclaim_write(struct file *file, const char __user *buf,
+					size_t count, loff_t *ppos)
+{
+	struct task_struct *task;
+	char buffer[200];
+	struct mm_struct *mm;
+	struct vm_area_struct *vma;
+	enum reclaim_type type;
+	char *type_buf;
+	struct mm_walk reclaim_walk = {};
+	unsigned long start = 0;
+	unsigned long end = 0;
+	struct reclaim_param rp;
+#ifdef CONFIG_HUAWEI_SWAP_ZDATA
+	int walk_ret;
+	struct timeval start_time = {0,0};
+	struct timeval stop_time;
+	s64 elapsed_centisecs64;
+	rp.hiber = false;
+#endif
+
+	memset(buffer, 0, sizeof(buffer));
+	if (count > sizeof(buffer) - 1)
+		count = sizeof(buffer) - 1;
+
+	if (copy_from_user(buffer, buf, count))
+		return -EFAULT;
+
+	type_buf = strstrip(buffer);
+#ifdef CONFIG_HUAWEI_SWAP_ZDATA
+	rp.hiber = false;
+#endif
+	if (!strcmp(type_buf, "file"))
+		type = RECLAIM_FILE;
+	else if (!strcmp(type_buf, "anon"))
+		type = RECLAIM_ANON;
+	else if (!strcmp(type_buf, "all"))
+		type = RECLAIM_ALL;
+#ifdef CONFIG_HUAWEI_SWAP_ZDATA
+	else if (!strcmp(type_buf, "hiber")) {
+		type = RECLAIM_ALL;
+		rp.hiber = true;
+	} else if (!strcmp(type_buf, "hiber_anon")) {
+		type = RECLAIM_ANON;
+		rp.hiber = true;
+	} else if (!strcmp(type_buf, "hiber_file")) {
+		type = RECLAIM_FILE;
+		rp.hiber = true;
+	}
+#endif
+	else if (isdigit(*type_buf))
+		type = RECLAIM_RANGE;
+	else
+		goto out_err;
+	rp.type = type;
+
+	if (type == RECLAIM_RANGE){
+		char *token;
+		unsigned long long len, len_in, tmp;
+		token = strsep(&type_buf, " ");
+		if (!token)
+			goto out_err;
+			tmp = memparse(token, &token);
+		if (tmp & ~PAGE_MASK || tmp > ULONG_MAX)
+			goto out_err;
+			start = tmp;
+
+		token = strsep(&type_buf, " ");
+		if (!token)
+			goto out_err;
+		len_in = memparse(token, &token);
+		len = (len_in + ~PAGE_MASK) & PAGE_MASK;
+		if (len > ULONG_MAX)
+			goto out_err;
+		/*
+		* Check to see whether len was rounded up from small -ve
+		* to zero.
+		*/
+		if (len_in && !len)
+			goto out_err;
+
+		end = start + len;
+		if (end < start)
+			goto out_err;
+	}
+
+	task = get_proc_task(file->f_path.dentry->d_inode);
+	if (!task)
+		return -ESRCH;
+
+	mm = get_task_mm(task);
+	if (!mm)
+		goto out;
+
+	reclaim_walk.mm = mm;
+	reclaim_walk.pmd_entry = reclaim_pte_range;
+
+	rp.nr_to_reclaim = INT_MAX;
+	rp.nr_reclaimed = 0;
+	reclaim_walk.private = &rp;
+#ifdef CONFIG_HUAWEI_SWAP_ZDATA
+	rp.nr_writedblock = 0;
+	if (rp.hiber)
+		do_gettimeofday(&start_time);
+#endif
+
+	down_read(&mm->mmap_sem);
+	if (type == RECLAIM_RANGE) {
+		vma = find_vma(mm, start);
+		while (vma) {
+			if (vma->vm_start > end)
+				break;
+			if (is_vm_hugetlb_page(vma))
+				continue;
+
+			rp.vma = vma;
+			walk_page_range(max(vma->vm_start, start),
+				min(vma->vm_end, end),
+				&reclaim_walk);
+			vma = vma->vm_next;
+		}
+	} else {
+		for (vma = mm->mmap; vma; vma = vma->vm_next) {
+			if (is_vm_hugetlb_page(vma))
+				continue;
+
+			rp.vma = vma;
+#ifdef CONFIG_HUAWEI_SWAP_ZDATA
+			walk_ret = walk_page_range(vma->vm_start, vma->vm_end,
+					&reclaim_walk);
+			if ((walk_ret == -EINTR) && rp.hiber)
+				break;
+#else
+			walk_page_range(vma->vm_start, vma->vm_end,
+					&reclaim_walk);
+#endif
+		}
+	}
+
+	flush_tlb_mm(mm);
+	up_read(&mm->mmap_sem);
+	mmput(mm);
+#ifdef CONFIG_HUAWEI_SWAP_ZDATA
+	if (rp.hiber) {
+		do_gettimeofday(&stop_time);
+		elapsed_centisecs64 = timeval_to_ns(&stop_time) -
+				timeval_to_ns(&start_time);
+
+		process_reclaim_result_write(task, (unsigned)rp.nr_reclaimed,
+		rp.nr_writedblock, elapsed_centisecs64);
+	}
+#endif
+out:
+	put_task_struct(task);
+	return count;
+
+out_err:
+	return -EINVAL;
+}
+
+const struct file_operations proc_reclaim_operations = {
+		.write		 = reclaim_write,
+		.llseek		 = noop_llseek,
+};
+#endif
 
 #ifdef CONFIG_NUMA
 

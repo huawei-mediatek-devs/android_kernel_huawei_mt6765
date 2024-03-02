@@ -369,17 +369,13 @@ put_name:
 	/* See if the low-level filesystem might want
 	 * to use its own hash
 	 */
-	lower_dentry = d_hash_and_lookup(lower_dir_dentry, &dname);
+	lower_dentry = lookup_one_len_unlocked(dname.name, lower_dir_dentry,
+					       dname.len);
 	if (IS_ERR(lower_dentry))
 		return lower_dentry;
-	if (!lower_dentry) {
-		/* We called vfs_path_lookup earlier, and did not get a negative
-		 * dentry then. Don't confuse the lower filesystem by forcing
-		 * one on it now...
-		 */
+
+	if (d_really_is_negative(lower_dentry))
 		err = -ENOENT;
-		goto out;
-	}
 
 	lower_path.dentry = lower_dentry;
 	lower_path.mnt = mntget(lower_dir_mnt);
@@ -426,7 +422,12 @@ struct dentry *sdcardfs_lookup(struct inode *dir, struct dentry *dentry,
 	}
 
 	/* save current_cred and override it */
-	OVERRIDE_CRED_PTR(SDCARDFS_SB(dir->i_sb), saved_cred, SDCARDFS_I(dir));
+	saved_cred = override_fsids(SDCARDFS_SB(dir->i_sb),
+						SDCARDFS_I(dir)->data);
+	if (!saved_cred) {
+		ret = ERR_PTR(-ENOMEM);
+		goto out_err;
+	}
 
 	sdcardfs_get_lower_path(parent, &lower_parent_path);
 
@@ -457,7 +458,7 @@ struct dentry *sdcardfs_lookup(struct inode *dir, struct dentry *dentry,
 
 out:
 	sdcardfs_put_lower_path(parent, &lower_parent_path);
-	REVERT_CRED(saved_cred);
+	revert_fsids(saved_cred);
 out_err:
 	dput(parent);
 	return ret;
