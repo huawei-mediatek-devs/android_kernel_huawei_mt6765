@@ -19,7 +19,7 @@ static bool touchscreen_get_prop_u32(struct device *dev,
 				     unsigned int default_value,
 				     unsigned int *value)
 {
-	u32 val;
+	u32 val = 0;
 	int error;
 
 	error = device_property_read_u32(dev, property, &val);
