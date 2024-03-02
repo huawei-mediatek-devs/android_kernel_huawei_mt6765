@@ -7,7 +7,12 @@
  * (C) 2007 SGI, Christoph Lameter
  */
 #include <linux/kobject.h>
-
+#ifdef CONFIG_MEMCG
+#include <linux/slab.h>
+#endif
+#ifdef CONFIG_KASAN
+#include <linux/kasan.h>
+#endif
 enum stat_item {
 	ALLOC_FASTPATH,		/* Allocation from cpu slab */
 	ALLOC_SLOWPATH,		/* Allocation by getting a new cpu slab */
