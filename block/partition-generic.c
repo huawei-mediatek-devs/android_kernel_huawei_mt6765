@@ -21,10 +21,13 @@
 
 #include "partitions/check.h"
 
+#ifdef CONFIG_HUAWEI_BLK_FLUSH_REDUCE
+#include "huawei-blk-flush.h"
+#endif
+
 #ifdef CONFIG_BLK_DEV_MD
 extern void md_autodetect_dev(dev_t dev);
 #endif
- 
 /*
  * disk_name() is used by partition check code and the genhd driver.
  * It formats the devicename of the indicated disk into
@@ -467,6 +470,9 @@ rescan:
 		}
 		return -EIO;
 	}
+#ifdef CONFIG_HUAWEI_BLK_FLUSH_REDUCE
+	huawei_blk_check_partition_done(disk, true);
+#endif
 	/*
 	 * If any partition code tried to read beyond EOD, try
 	 * unlocking native capacity even if partition table is
